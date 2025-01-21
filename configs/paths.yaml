@@ -1,0 +1,7 @@
+paths:
+  root_dir: ${oc.env:PROJECT_ROOT}
+  log_dir: ${paths.root_dir}/logs/${experiment.wandb.project}/${experiment.wandb.name}
+  wandb_dir: ${paths.root_dir}/logs
+  ckpt_dir: ${paths.log_dir}/ckpt
+  inference_dir: ${paths.log_dir}/inference
+  data_dir: ${paths.root_dir}/data/mof/cif_200_inf

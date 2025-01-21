@@ -1,0 +1,129 @@
+defaults:
+  - _self_
+  - model
+  - paths
+  - lattice
+
+data:
+  task: mof_assembly
+  dataset: cif_200_inf
+  cache_dir: ${paths.data_dir}
+
+  loader:
+    num_workers: 4
+    prefetch_factor: 10
+
+  sampler:
+    # Setting for 48GB GPUs
+    max_batch_size: 160
+    max_num_res_squared: 1_600_000
+
+interpolant:
+  min_t: 1e-2
+
+  twisting:
+    use: False
+
+  rots:
+    corrupt: True
+    sample_schedule: exp
+    exp_rate: 10
+
+  trans: 
+    corrupt: True
+    batch_ot: True
+    sample_schedule: linear
+    sample_temp: 1.0
+    vpsde_bmin: 0.1
+    vpsde_bmax: 20.0
+    potential: null
+    potential_t_scaling: False
+    rog:
+      weight: 10.0
+      cutoff: 5.0
+
+  lattice:
+    corrupt: True
+    lognormal:
+      loc: ${lattice.lognormal.loc}
+      scale: ${lattice.lognormal.scale}
+    uniform:
+      low: 60.0
+      high: 120.0
+      eps: 0.1
+
+  sampling:
+    num_timesteps: 100
+    do_sde: False
+
+  self_condition: ${model.edge_features.self_condition}
+
+experiment:
+  debug: False
+  seed: 123
+  num_devices: 8
+  warm_start: null
+  warm_start_cfg_override: True
+  training:
+    mask_plddt: True
+    bb_atom_scale: 0.1
+    trans_scale: 0.1
+    translation_loss_weight: 2.0
+    t_normalize_clip: 0.9
+    rotation_loss_weights: 1.0
+    aux_loss_weight: 0.0
+    aux_loss_use_bb_loss: True
+    aux_loss_use_pair_loss: True
+    aux_loss_t_pass: 0.5
+    cell_scale: 0.1
+    cell_loss_weight: 0.1
+  wandb:
+    name: ${data.task}_${data.dataset}
+    project: mof-csp
+    save_dir: ${paths.wandb_dir}
+  wandb_watch:
+    log: 'all'
+    log_freq: 500
+  optimizer:
+    lr: 1e-4
+    betas:
+      - 0.9
+      - 0.98
+    eps: 1e-8
+    weight_decay: 1e-2
+  use_lr_scheduler: True
+  lr_scheduler:
+    factor: 0.6
+    patience: 10
+    min_lr: 1e-6
+  trainer:
+    overfit_batches: 0
+    min_epochs: 1 # prevents early stopping
+    max_epochs: 1000
+    accelerator: gpu
+    log_every_n_steps: 1
+    deterministic: False
+    strategy: ddp
+    val_check_interval: 0.10
+    check_val_every_n_epoch: 1
+    accumulate_grad_batches: 1
+    gradient_clip_val: 0.5
+  checkpointer:
+    dirpath: ${paths.ckpt_dir}
+    save_last: True
+    save_top_k: 5
+    monitor: valid/loss
+    filename: epoch_{epoch}-step_{step}-loss_{valid/loss:.4f}
+    auto_insert_metric_name: False
+    mode: min
+  # Keep this null. Will be populated at runtime.
+  inference_dir: null
+
+matcher:
+  stol: 0.5
+  angle_tol: 10.0
+  ltol: 0.3
+
+hydra:
+  run:
+    dir: ${paths.log_dir}
