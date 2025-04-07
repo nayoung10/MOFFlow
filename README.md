@@ -1,3 +1,5 @@
+Edit: Full dataset, checkpoints, and detailed description will be available shortly.
+
 ## Environment 
 
 ### Create environment 
