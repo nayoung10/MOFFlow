@@ -11,16 +11,13 @@ model:
     timestep_int: 1000
     embed_chain: False
   edge_features:
-    single_bias_transition_n: 2
     c_s: ${model.node_embed_size}
     c_p: ${model.edge_embed_size}
-    relpos_k: 64
     feat_dim: 64
     num_bins: 22
-    self_condition: True
-    embed_chain: False
-    embed_diffuse_mask: True
-  ipa:
+    max_radius: .inf
+    max_neighbors: 1000
+  mpa:
     c_s: ${model.node_embed_size}
     c_z: ${model.edge_embed_size}
     c_hidden: 64
@@ -34,6 +31,7 @@ model:
     c_node_dim: 64
     c_edge_dim: 64
     c_hidden_dim: 64
-    max_atoms: 100
     max_radius: 5
+    max_neighbors: 100
+    max_atoms: 100
     num_layers: 4

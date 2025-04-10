@@ -14,32 +14,26 @@ class NodeFeatureNet(nn.Module):
         self.c_timestep_emb = self._cfg.c_timestep_emb
         self.bb_embedder = nn.Linear(self.c_bb_input, self.c_bb_emb, bias=False)
 
-        embed_size = self._cfg.c_bb_emb + self._cfg.c_timestep_emb * 2 + 1
+        embed_size = self._cfg.c_bb_emb + self._cfg.c_timestep_emb * 2
         self.linear = nn.Linear(embed_size, self.c_s)
 
-    def embed_t(self, timesteps, mask):
+    def embed_t(self, timesteps):
         timestep_emb = get_time_embedding(
             timesteps[:, 0],
             self.c_timestep_emb,
             max_positions=2056
-        )[:, None, :].repeat(1, mask.shape[1], 1)
-        return timestep_emb * mask.unsqueeze(-1)
+        )
+        return timestep_emb
 
-    def forward(self, so3_t, r3_t, res_mask, diffuse_mask, bb_emb):
-        # s: [b]
-
-        b, num_bb, device = res_mask.shape[0], res_mask.shape[1], res_mask.device
-
-        # [b, num_bb, c_bb_emb]
+    def forward(self, so3_t, r3_t, bb_emb):
+        # [M, c_bb_emb]
         bb_emb = self.bb_embedder(bb_emb)
-        bb_emb = bb_emb * res_mask.unsqueeze(-1)
 
-        # [b, num_bb, c_timestep_emb]
+        # [M, c_timestep_emb]
         input_feats = [
             bb_emb,
-            diffuse_mask[..., None],
-            self.embed_t(so3_t, res_mask),
-            self.embed_t(r3_t, res_mask)
+            self.embed_t(so3_t),
+            self.embed_t(r3_t)
         ]
 
         return self.linear(torch.cat(input_feats, dim=-1))

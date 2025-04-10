@@ -9,6 +9,7 @@ import pandas as pd
 import logging
 import torch.distributed as dist
 from pytorch_lightning import LightningModule
+from torch_geometric.utils import scatter
 from models.flow_model import FlowModel
 from models import utils as mu
 from data.interpolant import Interpolant
@@ -125,10 +126,6 @@ class FlowModule(LightningModule):
 
     def model_step(self, noisy_batch: Any):
         training_cfg = self._exp_cfg.training
-        loss_mask = noisy_batch['res_mask'] * noisy_batch['diffuse_mask']
-        if torch.any(torch.sum(loss_mask, dim=-1) < 1):
-            raise ValueError('Empty batch encountered')
-        num_batch, num_bb = loss_mask.shape
 
         # Ground truth labels
         gt_trans_1 = noisy_batch['trans_1']
@@ -139,16 +136,15 @@ class FlowModule(LightningModule):
             rotmats_t, gt_rotmats_1.type(torch.float32))
         if torch.any(torch.isnan(gt_rot_vf)):
             raise ValueError('NaN encountered in gt_rot_vf')
-        gt_bb_atoms = noisy_batch['gt_coords']
 
         # Timestep used for normalization
-        r3_t = noisy_batch['r3_t']
-        so3_t = noisy_batch['so3_t']
-        l_t= noisy_batch['l_t']
+        r3_t = noisy_batch['r3_t']          # [M, 1]
+        so3_t = noisy_batch['so3_t']        # [M, 1]
+        l_t= noisy_batch['l_t']             # [B, 1]
         r3_norm_scale = 1 - torch.min(
-            r3_t[..., None], torch.tensor(training_cfg.t_normalize_clip))
+            r3_t, torch.tensor(training_cfg.t_normalize_clip))
         so3_norm_scale = 1 - torch.min(
-            so3_t[..., None], torch.tensor(training_cfg.t_normalize_clip)
+            so3_t, torch.tensor(training_cfg.t_normalize_clip)
         )
         l_norm_scale = 1 - torch.min(
             l_t, torch.tensor(training_cfg.t_normalize_clip)
@@ -156,41 +152,36 @@ class FlowModule(LightningModule):
 
         # Model output predictions
         model_output = self.model(noisy_batch)
-        pred_trans_1 = model_output['pred_trans']
+        pred_trans_1 = model_output['pred_trans']                       # [M, 3]
         pred_rotmats_1 = model_output['pred_rotmats']
-        pred_rots_vf = so3_utils.calc_rot_vf(rotmats_t, pred_rotmats_1)
+        pred_rots_vf = so3_utils.calc_rot_vf(rotmats_t, pred_rotmats_1) # [M, 3]
         if torch.any(torch.isnan(pred_rots_vf)):
             raise ValueError('NaN encountered in pred_rots_vf')
-        pred_lattice_1 = model_output['pred_lattice']
+        pred_lattice_1 = model_output['pred_lattice']                   # [B, 6]
 
-        # Translation VF loss
-        loss_denom = torch.sum(loss_mask, dim=-1) * 3
-
+        # Translation VF loss (L2)
         trans_error = (gt_trans_1 - pred_trans_1) / r3_norm_scale * training_cfg.trans_scale
-        trans_loss = training_cfg.translation_loss_weight * torch.sum(
-            trans_error ** 2 * loss_mask[..., None],
-            dim=(-1, -2)
-        ) / loss_denom
-        trans_loss = torch.clamp(trans_loss, max=5)
-
-        # Rotation VF loss
+        trans_loss = training_cfg.translation_loss_weight * torch.mean(
+            trans_error ** 2, dim=-1)
+        trans_loss = scatter(trans_loss, noisy_batch.batch, reduce='mean')      # [B,]
+        trans_loss = torch.clamp(trans_loss, max=5)                             # [M,]
+        
+        # Rotation VF loss (L2)
         rots_vf_error = (gt_rot_vf - pred_rots_vf) / so3_norm_scale
-        rots_vf_loss = training_cfg.rotation_loss_weights * torch.sum(
-            rots_vf_error ** 2 * loss_mask[..., None],
-            dim=(-1, -2)
-        ) / loss_denom
+        rots_vf_loss = training_cfg.rotation_loss_weights * torch.mean(
+            rots_vf_error ** 2, dim=-1)                                         # [M,]
+        rots_vf_loss = scatter(rots_vf_loss, noisy_batch.batch, reduce='mean')  # [B,]
 
-        se3_vf_loss = trans_loss + rots_vf_loss
+        se3_vf_loss = trans_loss + rots_vf_loss                                 # [B,]
         if torch.any(torch.isnan(se3_vf_loss)):
             raise ValueError('NaN encountered in se3_vf_loss')
 
-        # Cell VF loss
+        # Cell VF loss (L2)
         cell_error = (gt_lattice_1 - pred_lattice_1) / l_norm_scale
         cell_error[:, :3] *= training_cfg.cell_scale
         cell_error[:, 3:] *= torch.pi / 180.0
         cell_loss = training_cfg.cell_loss_weight * torch.mean(
-            cell_error ** 2, dim=-1
-        )
+            cell_error ** 2, dim=-1)
 
         return {
             'trans_loss': trans_loss,
@@ -215,17 +206,14 @@ class FlowModule(LightningModule):
 
     def training_step(self, batch: Any, stage: int):
         step_start_time = time.time()
-        self.interpolant.set_device(batch['res_mask'].device)
+        self.interpolant.set_device(batch.trans_1.device)
         noisy_batch = self.interpolant.corrupt_batch(batch)
         if self._interpolant_cfg.self_condition and random.random() > 0.5:
             with torch.no_grad():
                 model_sc = self.model(noisy_batch)
-                noisy_batch['trans_sc'] = (
-                    model_sc['pred_trans'] * noisy_batch['diffuse_mask'][..., None]
-                    + noisy_batch['trans_1'] * (1 - noisy_batch['diffuse_mask'][..., None])
-                )
+                noisy_batch['trans_sc'] = model_sc['pred_trans']
         batch_losses = self.model_step(noisy_batch)
-        num_batch = batch_losses['trans_loss'].shape[0]
+        num_batch = batch.num_graphs
         total_losses = {
             k: torch.mean(v) for k,v in batch_losses.items()
         }
@@ -233,38 +221,22 @@ class FlowModule(LightningModule):
             self._log_scalar(
                 f"train/{k}", v, prog_bar=False, batch_size=num_batch)
 
-        # Losses to track. Stratified across t.
-        so3_t = torch.squeeze(noisy_batch['so3_t'])
+        # Time
+        batch_t = torch.squeeze(noisy_batch['l_t'])
         self._log_scalar(
-            "train/so3_t",
-            np.mean(du.to_numpy(so3_t)),
+            "train/t",
+            np.mean(du.to_numpy(batch_t)),
             prog_bar=False, batch_size=num_batch)
-        r3_t = torch.squeeze(noisy_batch['r3_t'])
-        self._log_scalar(
-            "train/r3_t",
-            np.mean(du.to_numpy(r3_t)),
-            prog_bar=False, batch_size=num_batch)
-        l_t = torch.squeeze(noisy_batch['l_t'])
-        self._log_scalar(
-            "train/l_t",
-            np.mean(du.to_numpy(l_t)),
-            prog_bar=False, batch_size=num_batch)
-        for loss_name, loss_dict in batch_losses.items():
-            if loss_name == 'rots_vf_loss':
-                batch_t = so3_t
-            elif loss_name == 'trans_loss':
-                batch_t = r3_t
-            else:
-                batch_t = l_t
+        
+        # Stratified losses
+        for loss_name, batch_loss in batch_losses.items():
             stratified_losses = mu.t_stratified_loss(
-                batch_t, loss_dict, loss_name=loss_name)
+                batch_t, batch_loss, loss_name=loss_name)
             for k, v in stratified_losses.items():
                 self._log_scalar(
                     f"train/{k}", v, prog_bar=False, batch_size=num_batch)
 
         # Training throughput
-        self._log_scalar(
-            "train/length", batch['res_mask'].shape[1], prog_bar=False, batch_size=num_batch)
         self._log_scalar(
             "train/batch_size", num_batch, prog_bar=False)
         step_time = time.time() - step_start_time
@@ -276,18 +248,14 @@ class FlowModule(LightningModule):
         return train_loss
 
     def validation_step(self, batch: Any, batch_idx: int):
-        assert not torch.is_grad_enabled()
+        # assert not torch.is_grad_enabled()
 
-        self.interpolant.set_device(batch['res_mask'].device)
+        self.interpolant.set_device(batch.trans_1.device)
         noisy_batch = self.interpolant.corrupt_batch(batch)
         if self._interpolant_cfg.self_condition and random.random() > 0.5:
             model_sc = self.model(noisy_batch)
-            noisy_batch['trans_sc'] = (
-                model_sc['pred_trans'] * noisy_batch['diffuse_mask'][..., None]
-                + noisy_batch['trans_1'] * (1 - noisy_batch['diffuse_mask'][..., None])
-            )
+            noisy_batch['trans_sc'] = model_sc['pred_trans']
         batch_losses = self.model_step(noisy_batch)
-        num_batch = batch_losses['trans_loss'].shape[0]
         total_losses = {
             k: torch.mean(v) for k,v in batch_losses.items()
         }
@@ -295,140 +263,23 @@ class FlowModule(LightningModule):
             self._log_scalar(
                 f"valid/{k}", v, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True, rank_zero_only=False)
 
-        # Losses to track. Stratified across t.
-        so3_t = torch.squeeze(noisy_batch['so3_t'])
+        # Time
+        batch_t = torch.squeeze(noisy_batch['l_t'])
         self._log_scalar(
-            "valid/so3_t",
-            np.mean(du.to_numpy(so3_t)),
+            "valid/t",
+            np.mean(du.to_numpy(batch_t)),
             on_step=False, on_epoch=True, prog_bar=False, sync_dist=True, rank_zero_only=False)
-        r3_t = torch.squeeze(noisy_batch['r3_t'])
-        self._log_scalar(
-            "valid/r3_t",
-            np.mean(du.to_numpy(r3_t)),
-            on_step=False, on_epoch=True, prog_bar=False, sync_dist=True, rank_zero_only=False)
-        l_t = torch.squeeze(noisy_batch['l_t'])
-        self._log_scalar(
-            "valid/l_t",
-            np.mean(du.to_numpy(l_t)),
-            on_step=False, on_epoch=True, prog_bar=False, sync_dist=True, rank_zero_only=False)
-        for loss_name, loss_dict in batch_losses.items():
-            if loss_name == 'rots_vf_loss':
-                batch_t = so3_t
-            elif loss_name == 'trans_loss':
-                batch_t = r3_t
-            else:
-                batch_t = l_t
+        
+        # Stratified losses
+        for loss_name, batch_loss in batch_losses.items():
             stratified_losses = mu.t_stratified_loss(
-                batch_t, loss_dict, loss_name=loss_name)
+                batch_t, batch_loss, loss_name=loss_name)
             for k,v in stratified_losses.items():
                 self._log_scalar(
                     f"valid/{k}", v, on_step=False, on_epoch=True, prog_bar=False, sync_dist=True, rank_zero_only=False)
 
         # Validation throughput
-        self._log_scalar(
-            "valid/length", batch['res_mask'].shape[1], on_step=False, on_epoch=True, prog_bar=False, sync_dist=True, rank_zero_only=False)
         valid_loss = total_losses['se3_vf_loss'] + total_losses['cell_loss']
         self._log_scalar(
             "valid/loss", valid_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, rank_zero_only=False)
         return valid_loss
-    
-    def predict_step(self, batch, batch_idx):
-        device = f'cuda:{torch.cuda.current_device()}'    
-        interpolant = Interpolant(self._infer_cfg.interpolant)
-        interpolant.set_device(device)
-
-        num_batch, num_bb = batch['res_mask'].shape
-
-        now = time.time()
-        mof_traj, _ = interpolant.sample(
-            num_batch=num_batch,
-            num_bb=num_bb,
-            model=self.model,
-            trans_1=batch['trans_1'],
-            rotmats_1=batch['rotmats_1'],
-            lattice_1=batch['lattice_1'],
-            diffuse_mask=batch['diffuse_mask'],
-            atom_types=batch['atom_types'],
-            local_coords=batch['local_coords'],
-            bb_num_vec=batch['bb_num_vec'],
-        )
-        elapsed = time.time() - now
-
-        pred_coords, pred_lattice = mof_traj[-1]
-
-        # Get global index
-        global_idx = batch_idx * dist.get_world_size() + dist.get_rank()
-        
-        # Set directory
-        sample_dir = os.path.join(
-            self.inference_dir,
-            f'sample_{global_idx}'
-        )
-        os.makedirs(sample_dir, exist_ok=True)
-
-        # Create structure files
-        atom_types = batch['atom_types'].squeeze().detach().cpu().numpy()
-        lattice = batch['lattice_1'].squeeze().detach().cpu().numpy()
-        gt_structure = Structure(
-            lattice=Lattice.from_parameters(*lattice),
-            species=atom_types,
-            coords=batch['gt_coords'].squeeze().detach().cpu().numpy(),
-            coords_are_cartesian=True
-        )
-        # Write ground truth structure
-        writer = CifWriter(gt_structure)
-        writer.write_file(os.path.join(sample_dir, f'gt_{global_idx}.cif'))
-        
-        try:
-            pred_structure = Structure(
-                lattice=Lattice.from_parameters(*pred_lattice.squeeze().detach().cpu().numpy()),
-                species=atom_types,
-                coords=pred_coords.detach().cpu().numpy(),
-                coords_are_cartesian=True
-            )
-            # Write predicted structure
-            writer = CifWriter(pred_structure)
-            writer.write_file(os.path.join(sample_dir, f'pred_{global_idx}.cif'))
-            
-            # Compute RMSD with structure matcher
-            rms_dist = self.matcher.get_rms_dist(gt_structure, pred_structure)
-            rms_dist = None if rms_dist is None else rms_dist[0]
-        except Exception as e:
-            print(f"ERROR:: {e}")
-            rms_dist = None
-
-        # Save results
-        self.results.append({
-            'sample_idx': global_idx,
-            'num_bb': num_bb,
-            'num_atoms': len(atom_types),
-            'rms_dist': rms_dist,
-            'time': elapsed
-        })
-        
-    def on_predict_epoch_end(self):
-        # Gather results
-        all_results = [None for _ in range(dist.get_world_size())]
-        dist.all_gather_object(all_results, self.results)
-
-        if dist.get_rank() == 0:
-            all_results = [item for sublist in all_results for item in sublist]
-            all_df = pd.DataFrame(all_results)
-            all_df = all_df.sort_values(by='sample_idx')
-        
-            # Compute average metrics
-            rms_dist = all_df['rms_dist'].dropna()
-            match_rate = len(rms_dist) / len(all_df) * 100
-            results = {
-                'match_rate': match_rate,
-                'rms_dist': rms_dist.mean() if len(rms_dist) > 0 else None,
-                'avg_time': all_df['time'].dropna().mean()
-            }
-
-            # Save average metrics to JSON
-            print(f"INFO:: {results}")
-            with open(os.path.join(self.inference_dir, 'average.json'), 'w') as f:
-                json.dump(results, f)
-
-            # Save results to CSV
-            all_df.to_csv(os.path.join(self.inference_dir, 'results.csv'), index=False)

@@ -12,6 +12,10 @@ data:
   loader:
     num_workers: 4
     prefetch_factor: 10
+    batch_size:
+      train: 160
+      valid: 160
+      test: 160
 
   sampler:
     # Setting for 48GB GPUs
@@ -56,7 +60,7 @@ interpolant:
     num_timesteps: 100
     do_sde: False
 
-  self_condition: ${model.edge_features.self_condition}
+  self_condition: True
 
 experiment:
   debug: False
@@ -99,12 +103,12 @@ experiment:
   trainer:
     overfit_batches: 0
     min_epochs: 1 # prevents early stopping
-    max_epochs: 1000
+    max_epochs: 200
     accelerator: gpu
     log_every_n_steps: 1
     deterministic: False
     strategy: ddp
-    val_check_interval: 0.10
+    val_check_interval: 1.0
     check_val_every_n_epoch: 1
     accumulate_grad_batches: 1
     gradient_clip_val: 0.5

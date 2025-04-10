@@ -15,11 +15,14 @@
 
 """Modified code of Openfold's IPA."""
 
+import copy
 import numpy as np
 import torch
 import math
-from scipy.stats import truncnorm
 import torch.nn as nn
+from scipy.stats import truncnorm
+from einops import rearrange
+from torch_geometric.utils import scatter, softmax
 from typing import Optional, Callable, List, Sequence
 from openfold.utils.rigid_utils import Rigid
 
@@ -217,21 +220,25 @@ class EdgeTransition(nn.Module):
         self.final_layer = Linear(hidden_size, edge_embed_out, init="final")
         self.layer_norm = nn.LayerNorm(edge_embed_out)
 
-    def forward(self, node_embed, edge_embed):
+    def forward(self, node_embed, edge_embed, edge_index):
+        """
+        Args:
+            node_embed (Tensor): [M, C]
+            edge_embed (Tensor): [E, C]
+            edge_index (Tensor): [2, E]
+        """
+        src, tgt = edge_index
+        
+        # Extract node features
         node_embed = self.initial_embed(node_embed)
-        batch_size, num_res, _ = node_embed.shape
-        edge_bias = torch.cat([
-            torch.tile(node_embed[:, :, None, :], (1, 1, num_res, 1)),
-            torch.tile(node_embed[:, None, :, :], (1, num_res, 1, 1)),
-        ], axis=-1)
-        edge_embed = torch.cat(
-            [edge_embed, edge_bias], axis=-1).reshape(
-                batch_size * num_res**2, -1)
+        h_src = node_embed[src] # [E, C]
+        h_tgt = node_embed[tgt] # [E, C]
+    
+        # Concatenate
+        edge_embed = torch.cat([edge_embed, h_src, h_tgt], dim=-1)
         edge_embed = self.final_layer(self.trunk(edge_embed) + edge_embed)
         edge_embed = self.layer_norm(edge_embed)
-        edge_embed = edge_embed.reshape(
-            batch_size, num_res, num_res, -1
-        )
+        
         return edge_embed
 
 
@@ -296,171 +303,245 @@ class MOFPointAttention(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
         self.softplus = nn.Softplus()
 
+    @staticmethod
+    def _pairwise_distances(edge_index, pos_source, pos_target):
+        """        
+        Args:
+            edge_index (Tensor): [2, E] edge index
+            pos_source (Tensor): [M, H, P, 3] node positions
+            pos_target (Tensor): [M, H, P, 3] node positions
+        Returns:
+            dists (Tensor): [E, H, P] pairwise distances
+        """
+        row, col = edge_index
+        dists = torch.norm(pos_source[col] - pos_target[row], p=2, dim=-1)
+
+        return dists
+    
     def forward(
         self,
         s: torch.Tensor,
-        z: Optional[torch.Tensor],
+        z: torch.Tensor,
         r: Rigid,
-        L: Optional[torch.Tensor],
-        mask: torch.Tensor,
-        _offload_inference: bool = False,
-        _z_reference_list: Optional[Sequence[torch.Tensor]] = None,
+        L: torch.Tensor,
+        edge_index: torch.Tensor,
+        num_bbs: torch.Tensor,
     ) -> torch.Tensor:
         """
         Args:
             s:
-                [*, N_res, C_s] single representation
+                [M, C_s] single representation
             z:
-                [*, N_res, N_res, C_z] pair representation
+                [E, C_z] pair representation
             r:
-                [*, N_res] transformation object
+                [M] transformation object
             L:
-                [*, 6] lattice parameters with angles in radians
-            mask:
-                [*, N_res] mask
+                [B, 6] lattice parameters with angles in radians
+            edge_index:
+                [2, E] edge index
+            num_bbs:
+                [B] number of building blocks
         Returns:
-            [*, N_res, C_s] single representation update
+            [M, C_s] single representation update
         """
-        if _offload_inference:
-            z = _z_reference_list
-        else:
-            z = [z]
-
         #######################################
         # Generate scalar and point activations
         #######################################
-        # [*, N_res, H * C_hidden]
-        q = self.linear_q(s)
-        kv = self.linear_kv(s)
+        # Compute q, k, v
+        q = self.linear_q(s)    # [M, H * C_hidden]
+        kv = self.linear_kv(s)  # [M, H * 2 * C_hidden]
 
-        # [*, N_res, H, C_hidden]
-        q = q.view(q.shape[:-1] + (self.no_heads, -1))
-
-        # [*, N_res, H, 2 * C_hidden]
-        kv = kv.view(kv.shape[:-1] + (self.no_heads, -1))
-
-        # [*, N_res, H, C_hidden]
-        k, v = torch.split(kv, self.c_hidden, dim=-1)
-
-        # [*, N_res, H * P_q * 3]
-        q_pts = self.linear_q_points(s)
-
-        # This is kind of clunky, but it's how the original does it
-        # [*, N_res, H * P_q, 3]
+        # Rearrange shapes
+        q = rearrange(q, "m (h c) -> m h c", h=self.no_heads)       # [M, H, C_hidden]
+        kv = rearrange(kv, "m (h d) -> m h d", h=self.no_heads)     # [M, H, 2 * C_hidden]
+        k, v = torch.split(kv, self.c_hidden, dim=-1)               # [M, H, C_hidden]
+        
+        # Compute q_pts
+        q_pts = self.linear_q_points(s)                                     # [M, H * P_q * 3]
         q_pts = torch.split(q_pts, q_pts.shape[-1] // 3, dim=-1)
-        q_pts = torch.stack(q_pts, dim=-1)
-        q_pts = r[..., None].apply(q_pts)
+        q_pts = torch.stack(q_pts, dim=-1)                                  # [M, H * P_q, 3]
+        q_pts = r[..., None].apply(q_pts)                                   # [M, H * P_q, 3]
+        q_pts = rearrange(q_pts, "m (h p) d -> m h p d", h=self.no_heads)   # [M, H, P_q, 3]
 
-        # [*, N_res, H, P_q, 3]
-        q_pts = q_pts.view(
-            q_pts.shape[:-2] + (self.no_heads, self.no_qk_points, 3)
-        )
-
-        # [*, N_res, H * (P_q + P_v) * 3]
-        kv_pts = self.linear_kv_points(s)
-
-        # [*, N_res, H * (P_q + P_v), 3]
+        # Compute kv_pts
+        kv_pts = self.linear_kv_points(s)                                   # [M, H * (P_q + P_v) * 3]
         kv_pts = torch.split(kv_pts, kv_pts.shape[-1] // 3, dim=-1)
-        kv_pts = torch.stack(kv_pts, dim=-1)
-        kv_pts = r[..., None].apply(kv_pts)
+        kv_pts = torch.stack(kv_pts, dim=-1)                                # [M, H * (P_q + P_v), 3]
+        kv_pts = r[..., None].apply(kv_pts)                                 # [M, H * (P_q + P_v), 3]
+        kv_pts = rearrange(kv_pts, "m (h p) d -> m h p d", h=self.no_heads) # [M, H, (P_q + P_v), 3]
 
-        # [*, N_res, H, (P_q + P_v), 3]
-        kv_pts = kv_pts.view(kv_pts.shape[:-2] + (self.no_heads, -1, 3))
-
-        # [*, N_res, H, P_q/P_v, 3]
+        # Split kv_pts into k_pts and v_pts
         k_pts, v_pts = torch.split(
             kv_pts, [self.no_qk_points, self.no_v_points], dim=-2
-        )
+        )                                                                   # [M, H, P_q, 3], [M, H, P_v, 3]
 
         ##########################
         # Compute attention scores
         ##########################
-        # [*, N_res, N_res, H]
-        b = self.linear_b(z[0])
+        # Compute b, l
+        b = self.linear_b(z)    # [E, H]
+        l = self.linear_l(L)    # [B, H]
+        l = l.repeat_interleave(num_bbs, dim=0)  # [M, H]
 
-        # [*, 1, 1, H]
-        l = self.linear_l(L)[:, None, None, :]
+        # Compute attention scores
+        src, tgt = edge_index
         
-        if(_offload_inference):
-            z[0] = z[0].cpu()
-
-        # [*, H, N_res, N_res]
-        a = torch.matmul(
-            permute_final_dims(q, (1, 0, 2)),  # [*, H, N_res, C_hidden]
-            permute_final_dims(k, (1, 2, 0)),  # [*, H, C_hidden, N_res]
-        )
-        a *= math.sqrt(1.0 / (4 * self.c_hidden))
-        a += (math.sqrt(1.0 / 4) * permute_final_dims(b, (2, 0, 1)))
-        a += (math.sqrt(1.0 / 4) * permute_final_dims(l, (2, 0, 1)))
-
-        # [*, N_res, N_res, H, P_q, 3]
-        pt_displacement = q_pts.unsqueeze(-4) - k_pts.unsqueeze(-5)
+        # Query-key attention
+        a = torch.einsum('ehc,ehc->eh', q[tgt], k[src])             # [E, H]
+        a *= math.sqrt(1.0 / (4 * self.c_hidden))                   # [E, H]
+        
+        # Edge, lattice attention
+        a += (math.sqrt(1.0 / 4) * b)                               # [E, H]
+        assert torch.allclose(l[src], l[tgt])
+        a += (math.sqrt(1.0 / 4) * l[src])                          # [E, H]
+        
+        # Point attention
+        pt_displacement = q_pts[tgt] - k_pts[src]                   # [E, H, P_q, 3]
         pt_att = pt_displacement ** 2
-
-        # [*, N_res, N_res, H, P_q]
-        pt_att = sum(torch.unbind(pt_att, dim=-1))
+        pt_att = sum(torch.unbind(pt_att, dim=-1))                  # [E, H, P_q]
         head_weights = self.softplus(self.head_weights).view(
-            *((1,) * len(pt_att.shape[:-2]) + (-1, 1))
+            *((1,) * len(pt_att.shape[:-2]) + (-1, 1))              # [1, H, 1]
         )
         head_weights = head_weights * math.sqrt(
-            1.0 / (4 * (self.no_qk_points * 9.0 / 2))
+            1.0 / (4 * (self.no_qk_points * 9.0 / 2))               # [1, H, 1]
         )
-        pt_att = pt_att * head_weights
-
-        # [*, N_res, N_res, H]
-        pt_att = torch.sum(pt_att, dim=-1) * (-0.5)
-        # [*, N_res, N_res]
-        square_mask = mask.unsqueeze(-1) * mask.unsqueeze(-2)
-        square_mask = self.inf * (square_mask - 1)
-
-        # [*, H, N_res, N_res]
-        pt_att = permute_final_dims(pt_att, (2, 0, 1))
-        
-        a = a + pt_att 
-        a = a + square_mask.unsqueeze(-3)
-        a = self.softmax(a)
+        pt_att = pt_att * head_weights                              # [E, H, P_q]
+        pt_att = torch.sum(pt_att, dim=-1) * (-0.5)                 # [E, H]
+        a = a + pt_att
+        a = softmax(a, tgt, dim=0)                                  # [E, H]
 
         ################
         # Compute output
         ################
-        # [*, N_res, H, C_hidden]
-        o = torch.matmul(
-            a, v.transpose(-2, -3)
-        ).transpose(-2, -3)
+        # Compute o 
+        o_msg = a[..., None] * v[src]                               # [E, H, C_hidden]
+        o = scatter(o_msg, tgt, dim=0, reduce='sum')                # [M, H, C_hidden]
+        o = rearrange(o, "m h c -> m (h c)")                        # [M, H * C_hidden]
 
-        # [*, N_res, H * C_hidden]
-        o = flatten_final_dims(o, 2)
+        # Compute o_pt
+        o_pt_msg = a[..., None, None] * v_pts[src]                  # [E, H, P_v, 3]
+        o_pt = scatter(o_pt_msg, tgt, dim=0, reduce='sum')          # [M, H, P_v, 3]
+        o_pt = rearrange(o_pt, "m h p d -> m (h p) d")              # [M, (H * P_v), 3]
 
-        # [*, H, 3, N_res, P_v] 
-        o_pt = torch.sum(
-            (
-                a[..., None, :, :, None]
-                * permute_final_dims(v_pts, (1, 3, 0, 2))[..., None, :, :]
-            ),
-            dim=-2,
-        )
+        # Compute o_l 
+        o_l = L.repeat_interleave(num_bbs, dim=0)                   # [M, 6]
 
-        # [*, N_res, H, P_v, 3]
-        o_pt = permute_final_dims(o_pt, (2, 0, 3, 1))
-
-        # [*, N_res, H * P_v, 3]
-        o_pt = o_pt.reshape(*o_pt.shape[:-3], -1, 3)
-
-        if(_offload_inference):
-            z[0] = z[0].to(o_pt.device)
-
-        # [*, N_res, 6]
-        L = L.unsqueeze(1).repeat(1, o.shape[1], 1)
-        o_feats = [o, *torch.unbind(o_pt, dim=-1), L]
-
-        # [*, N_res, C_s]
-        s = self.linear_out(
-            torch.cat(
-                o_feats, dim=-1
-            )
-        )
+        # Concatenate o, o_pt, o_l
+        o_feats = [o, *torch.unbind(o_pt, dim=-1), o_l]             
+        o_feats = torch.cat(o_feats, dim=-1)                        # [M, (H * C_hidden + H * P_v * 3 + 6)]
+        
+        # Compute s
+        s = self.linear_out(o_feats)                                # [M, C_s]
         
         return s
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, nhead):
+        super(MultiHeadAttention, self).__init__()
+        
+        # Parameters
+        self.d_model = d_model
+        self.nheads = nhead
+        self.head_dim = d_model // nhead
+        assert self.head_dim * self.nheads == self.d_model
+        self.scale = 1.0 / math.sqrt(self.head_dim)
+        
+        # Modules
+        self.linear_q = nn.Linear(d_model, d_model)
+        self.linear_kv = nn.Linear(d_model, 2 * d_model)
+        self.to_out = nn.Linear(d_model, d_model)
+    
+    def forward(
+        self,
+        s: torch.Tensor,
+        edge_index: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            s (Tensor): [M, C] node representation
+            edge_index (Tensor): [2, E] edge index
+        Returns:
+            o (Tensor): [M, C] updated node representation
+        """
+        # Compute q, k, v
+        q = self.linear_q(s)    # [M, H * C]
+        kv = self.linear_kv(s)  # [M, H * 2 * C]
+        
+        # Rearrange shapes
+        q = rearrange(q, "m (h c) -> m h c", h=self.nheads)       # [M, H, C]
+        kv = rearrange(kv, "m (h d) -> m h d", h=self.nheads)     # [M, H, 2 * C]
+        k, v = torch.split(kv, self.head_dim, dim=-1)             # [M, H, C]
+        
+        # Compute attention scores
+        src, tgt = edge_index
+        a = torch.einsum('ehc,ehc->eh', q[tgt], k[src])          # [E, H]
+        a *= self.scale                                          # [E, H]
+        a = softmax(a, tgt, dim=0)                               # [E, H]
+        
+        # Aggregate messages
+        o_msg = a[..., None] * v[src]                            # [E, H, C]
+        o = scatter(o_msg, tgt, dim=0, reduce='sum')             # [M, H, C]
+        o = rearrange(o, "m h c -> m (h c)")                     # [M, H * C]
+        
+        return self.to_out(o)
+
+
+class TransformerEncoderLayer(nn.Module):
+    """
+    Pre-ln Transformer encoder layer for pyg batch
+    """
+    def __init__(
+        self, 
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int
+    ):
+        super(TransformerEncoderLayer, self).__init__()
+        
+        # Layers
+        self.mha = MultiHeadAttention(d_model, nhead)
+        self.mha_ln = nn.LayerNorm(d_model)
+        
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.ReLU(),
+            nn.Linear(dim_feedforward, d_model))
+        self.ffn_ln = nn.LayerNorm(d_model)
+    
+    def forward(
+        self,
+        s: torch.Tensor,
+        edge_index: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Args:
+            s (Tensor): [M, C] node representation
+            edge_index (Tensor): [2, E] edge index
+        Returns:
+            s (Tensor): [M, C] updated node representation
+        """
+        # Multi-head attention
+        s = self.mha(self.mha_ln(s), edge_index) + s
+        
+        # Feed-forward network
+        s = self.ffn(self.ffn_ln(s)) + s
+        
+        return s
+
+    
+class TransformerEncoder(nn.Module):
+    def __init__(self, 
+        encoder_layer: nn.Module, num_layers: int):
+        super(TransformerEncoder, self).__init__()
+        
+        self.layers = nn.ModuleList([copy.deepcopy(encoder_layer) for _ in range(num_layers)])
+        
+    def forward(self, node_embed, edge_index):
+        for layer in self.layers:
+            node_embed = layer(node_embed, edge_index)
+        
+        return node_embed
 
 
 class BackboneUpdate(nn.Module):
@@ -484,11 +565,10 @@ class BackboneUpdate(nn.Module):
     def forward(self, s: torch.Tensor):
         """
         Args:
-            [*, N_res, C_s] single representation
+            [M, C_s] single representation
         Returns:
-            [*, N_res, 6] update vector 
+            [M, 6] update vector 
         """
-        # [*, 6]
         update = self.linear(s)
 
         return update
@@ -510,15 +590,15 @@ class LatticeOutput(nn.Module):
             nn.Linear(c_s, 6),
         )
 
-    def forward(self, s: torch.Tensor):
+    def forward(self, s: torch.Tensor, batch_vec: torch.Tensor):
         """
         Args:
-            [*, M, C_s] single representation
+            s (Tensor): [M, C_s] node representation
+            batch_vec (Tensor): [M,] batch vector
         Returns:
-            [*, 3, 3] update lattice matrix 
+            output (Tensor): [B, 6] output lattice matrix
         """
-        # [*, 6]
-        s = torch.mean(s, dim=1) # [*, C_s]
-        output = torch.nn.functional.softplus(self.output(s))
+        s = scatter(s, batch_vec, dim=0, reduce='mean')         # [B, C_s]
+        output = torch.nn.functional.softplus(self.output(s))   # [B, 6]
 
         return output

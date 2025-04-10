@@ -3,9 +3,9 @@
 ### Create environment 
 ```bash
 mamba env create -f env.yml
+mamba activate mofflow
 pip install git+https://github.com/microsoft/MOFDiff.git
 pip install -e .
-mamba activate mofflow
 ```
 
 For **property computation**, we need to install `zeo++` from [here](https://www.zeoplusplus.org/download.html). 
@@ -49,6 +49,18 @@ python experiments/inference.py \
     inference.inference_dir=<output_dir>
 ```
 
+## Predict
+To predict the MOF structures for the test set, run the following code. You may specify the number of samples to generate per test sample.
+
+```bash
+python experiments/predict.py \
+    experiment.wandb.name=<expname> \
+    inference.num_samples=<num_samples> \   # default to 1
+    inference.interpolant.sampling.num_timesteps=<timesteps> \ # default to 50
+    inference.ckpt_path='${paths.ckpt_dir}/last.ckpt' \   # default
+    inference.inference_dir='${paths.log_dir}/inference' \  # default 
+```
+
 ## Evaluation 
 
 ### Validity
@@ -68,11 +80,10 @@ You may need to adjust the code based on how the ground-truth and predicted cif 
 export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 export OMP_NUM_THREADS=1
-python evaluation/rmsd.py \
-    --cif_dir <inference_dir> \
-    --gt_prefix <gt_prefix> \
-    --pred_prefix <pred_prefix> \
-    --num_cpus <num_cpus>
+python experiments/evaluate.py
+    --save_pt <path/to/predict.pt> \
+    --num_samples <k> \ # inferred from data shape if not provided; use if k < k_generated
+    --num_cpus <ncpu> \ # default to 48
 ```
 
 ### Property computation (with `zeo++`)

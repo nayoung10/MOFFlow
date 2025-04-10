@@ -1,6 +1,8 @@
 notebooks/
 data/mof/
 data/cif/
+data/bb/
+tmp/
 logs/
 wandb/
 wandb*.json

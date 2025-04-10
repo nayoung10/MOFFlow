@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
-from einops import rearrange
-from torch_cluster import radius_graph
-from torch_geometric.nn.pool import global_mean_pool
+from torch_geometric.nn.pool import (
+    radius_graph,
+    global_mean_pool
+)
 
 from data import utils as du
 from models.egnn import E_GCL
@@ -48,59 +49,56 @@ class BuildingBlockEmbedder(nn.Module):
             )
 
     @staticmethod
-    def _pairwise_distances(x):
+    def _pairwise_distances(edge_index, pos):
         """        
         Args:
-            x (torch.Tensor): Tensor of shape [B, N, 3], representing the coordinates.
+            edge_index (Tensor): [2, E] edge index
+            pos (Tensor): [N, 3] node positions
+        Returns:
+            dists (Tensor): [E] pairwise distances
         """
+        row, col = edge_index
+        dists = torch.norm(pos[col] - pos[row], p=2, dim=-1)
 
-        dists = torch.norm(x[:, :, None, :] - x[:, None, :, :], dim=-1)  # Shape: [B, N, N]
         return dists
 
+    @staticmethod
+    def _repeat_interleave(repeats):
+        outs = [torch.full((n, ), i) for i, n in enumerate(repeats)]
+        return torch.cat(outs, dim=0).to(repeats.device)
+    
     def forward(self, batch):
-        batch_size, num_atoms = batch['atom_types'].shape
-        atom_types = batch['atom_types']        # [B, N]
-        local_coords = batch['local_coords']    # [B, N, 3]
-        bb_num_vec = batch['bb_num_vec'][0]     # [M]
-        device = local_coords.device
+        local_coords = batch['local_coords']    # [N, 3]
 
         # Compute node features
-        node_attr = self.atom_type_embedder(atom_types - 1)     # [B, N, D]
-        node_attr = rearrange(node_attr, 'b n d -> (b n) d')    # [B*N, D]
-
-        # Compute edge distance features
-        pair_dist = self._pairwise_distances(local_coords)      # [B, N, N]
-        edge_feats = self.edge_dist_embedder(pair_dist)         # [B*N*N, D]
-        edge_feats = rearrange(edge_feats, '(b n1 n2) d -> b n1 n2 d', b=batch_size, n1=num_atoms)  # [B, N, N, D]
+        node_attr = self.atom_type_embedder(batch['atom_types'] - 1)     # [N, D]
 
         # Compute edge index
-        bb_vector = torch.cat([torch.full((num,), i) for i, num in enumerate(bb_num_vec)]).int()
-        bb_vector = torch.tensor([i + b*len(bb_num_vec) for b in range(batch_size) for i in bb_vector]).to(device)
-        local_coords = rearrange(batch['local_coords'], 'b n d -> (b n) d')
-        intra_edge_index = radius_graph(local_coords, r=self._bb_cfg.max_radius, batch=bb_vector, loop=False)
+        batch_bb = self._repeat_interleave(batch['bb_num_vec'])
+        bb_edge_index = radius_graph(
+            x=local_coords, 
+            r=self._bb_cfg.max_radius, 
+            batch=batch_bb,
+            loop=False,
+            max_num_neighbors=self._bb_cfg.max_neighbors)
 
-        # Select edge attributes 
-        row, col = intra_edge_index
-        batch_vec = torch.arange(batch_size, device=device).repeat_interleave(num_atoms)
-        batch_indices = batch_vec[row]
-        intra_edge_attr = edge_feats[batch_indices, row % num_atoms, col % num_atoms]
-        assert intra_edge_attr.shape[0] == intra_edge_index.shape[-1]
-
+        # Compute edge distance features
+        pair_dist = self._pairwise_distances(bb_edge_index, local_coords)    # [E]
+        bb_edge_feats = self.edge_dist_embedder(pair_dist)                   # [E, D]
+                     
         # Message passing
         local_coords = local_coords * du.ANG_TO_NM_SCALE
         for i in range(len(self.egnn_layers)):
             node_update, _ = self.egnn_layers[i](
                 h=node_attr,
                 coord=local_coords,
-                edge_index=intra_edge_index,
-                edge_attr=intra_edge_attr
+                edge_index=bb_edge_index,
+                edge_attr=bb_edge_feats
             )
 
             node_attr = node_attr + node_update
         
         # Pooling
-        bb_attr = global_mean_pool(node_attr, bb_vector.long())
-        bb_attr = rearrange(bb_attr, '(b m) d -> b m d', b=batch_size)
-        # assert torch.allclose(bb_attr[0], bb_attr[-1]), f"bb_attr[0]: {bb_attr[0]}, bb_attr[-1]: {bb_attr[-1]}"
-
+        bb_attr = global_mean_pool(node_attr, batch_bb)  # [M, D]
+        
         return bb_attr

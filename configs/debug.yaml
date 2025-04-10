@@ -11,10 +11,14 @@ data:
   loader:
     num_workers: 4
     prefetch_factor: 10
+    batch_size:
+      train: 1
+      valid: 1
+      test: 1
 
   sampler:
     # Setting for 48GB GPUs
-    max_batch_size: 1
+    max_batch_size: 160
     max_num_res_squared: 1_600_000
 
 interpolant:
@@ -55,7 +59,7 @@ interpolant:
     num_timesteps: 100
     do_sde: False
 
-  self_condition: ${model.edge_features.self_condition}
+  self_condition: False
 
 experiment:
   debug: True
@@ -103,7 +107,7 @@ experiment:
     log_every_n_steps: 1
     deterministic: False
     strategy: ddp
-    val_check_interval: 0.10
+    val_check_interval: 1.0
     check_val_every_n_epoch: 1
     accumulate_grad_batches: 1
     gradient_clip_val: 0.5
@@ -140,16 +144,13 @@ model:
     timestep_int: 1000
     embed_chain: False
   edge_features:
-    single_bias_transition_n: 2
     c_s: ${model.node_embed_size}
     c_p: ${model.edge_embed_size}
-    relpos_k: 64
     feat_dim: 64
     num_bins: 22
-    self_condition: False
-    embed_chain: False
-    embed_diffuse_mask: False
-  ipa:
+    max_radius: .inf
+    max_neighbors: 1000
+  mpa:
     c_s: ${model.node_embed_size}
     c_z: ${model.edge_embed_size}
     c_hidden: 4
@@ -163,6 +164,7 @@ model:
     c_node_dim: 64
     c_edge_dim: 64
     c_hidden_dim: 64
-    max_atoms: 100
     max_radius: 5
+    max_neighbors: 100
+    max_atoms: 100
     num_layers: 1

@@ -6,6 +6,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 from torch.utils.data import Dataset
+from torch_geometric.data import Data
 from pymatgen.core.lattice import Lattice
 from mofdiff.common.data_utils import frac_to_cart_coords, lattice_params_to_matrix_torch
 
@@ -245,15 +246,25 @@ class MOFDataset(Dataset):
         Returns: dictionary with following keys:
             - rotmats_1: [M, 3, 3]
             - trans_1: [M, 3]
-            - res_mask: [M,]
-            - diffuse_mask: [M,]
             - local_coords: [N, 3]
             - gt_coords: [N, 3]
             - bb_num_vec: [M,]
-            - bb_emb: [M, 3]
             - atom_types: [N,]
-            - lattice: [6,]
-            - cell: [3, 3]
+            - lattice_1: [1, 6]
+            - cell_1: [1, 3, 3]
         """
 
-        return self.processed_data[idx]
+        data = self.processed_data[idx]
+        return Data(
+            num_nodes=data['rotmats_1'].shape[0],
+            num_atoms=data['local_coords'].shape[0],
+            num_bbs=data['rotmats_1'].shape[0],
+            rotmats_1=data['rotmats_1'],
+            trans_1=data['trans_1'],
+            local_coords=data['local_coords'],
+            gt_coords=data['gt_coords'],
+            bb_num_vec=data['bb_num_vec'],
+            atom_types=data['atom_types'],
+            lattice_1=data['lattice_1'].unsqueeze(0),
+            cell_1=data['cell_1'].unsqueeze(0),
+        )
