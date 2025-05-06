@@ -123,7 +123,7 @@ python evaluation/property.py --cif_dir <inference_dir> --ncpu <num_cpus>
 If you find MOFFlow useful in your work, please consider citing the following:
 
 ```bibtex
-@article{kim2024mofflow,
+@inproceedings{kim2024mofflow,
   title={MOFFlow: Flow Matching for Structure Prediction of Metal-Organic Frameworks},
   author={Kim, Nayoung and Kim, Seongsu and Kim, Minsu and Park, Jinkyoo and Ahn, Sungsoo},
   booktitle={The Thirteenth International Conference on Learning Representations},
