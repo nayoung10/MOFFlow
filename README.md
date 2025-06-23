@@ -87,6 +87,19 @@ python experiments/train.py \
     +experiment.wandb.resume=must # resume wandb run
 ```
 
+## Predict
+
+To predict MOF structures for the test set, run the command below. You can adjust the number of generated samples per test example. For more details, see the inference settings in `configs/inference.yaml`.
+
+```bash
+python experiments/predict.py \
+    experiment.wandb.name=<expname> \
+    inference.num_samples=<num_samples> \   # default to 1
+    inference.interpolant.sampling.num_timesteps=<timesteps> \ # default to 50
+    inference.ckpt_path='${paths.ckpt_dir}/last.ckpt' \   # default
+    inference.inference_dir='${paths.log_dir}/inference' \  # default 
+```
+
 ## Evaluation 
 
 ### RMSD
