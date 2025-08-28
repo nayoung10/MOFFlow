@@ -61,7 +61,7 @@ class Experiment:
             is_training=True
         )
         self._valid_dataset = MOFDataset(
-            cache_path=os.path.join(self._data_cfg.cache_dir, 'val_4000.pt'),
+            cache_path=os.path.join(self._data_cfg.cache_dir, 'val.pt'),
             dataset_cfg=self._data_cfg,
             is_training=False
         )
