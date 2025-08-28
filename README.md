@@ -120,7 +120,13 @@ python experiments/evaluate.py
 
 ### Property computation (with `zeo++`)
 
-To compute structural properties (e.g., surface area, pore volume), run:
+First, create cif files from the saved .pt file with:
+
+```bash
+python io/pt_to_cif.py --save_pt <path/to/predict.pt>
+```
+
+Then compute structural properties (e.g., surface area, pore volume) by:
 
 ```bash
 # Adjust settings as needed

@@ -95,3 +95,5 @@ assert (
 ), "You must configure the PROJECT_ROOT environment variable in a .env file!"
 
 os.chdir(PROJECT_ROOT)
+
+ZEO_PATH: Path = Path(get_env("ZEO_PATH"))
